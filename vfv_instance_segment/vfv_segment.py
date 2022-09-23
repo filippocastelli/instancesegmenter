@@ -23,8 +23,8 @@ import tifffile
 import pyclesperanto_prototype as cle
 from zetastitcher import VirtualFusedVolume, InputFile
 
-from autocropper import AutoCropper
-from integershearingcorrect import IntegerShearingCorrect
+from vfv_instance_segment.autocropper import AutoCropper
+from vfv_instance_segment.integershearingcorrect import IntegerShearingCorrect
 
 # monkeypatched properties
 def err_minor_axis_length(self):
@@ -463,7 +463,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
         y_overlap_arr_lower = np.zeros(shape=(self.vfv.shape[0], self.y_overlap, self.vfv.shape[2])) if y_slice.start > 0 else None
 
         start_label = start_label if start_label is not None else 1
-
+        sub_arr_shapes = []
         for idx, z_slice in enumerate(tqdm(z_overlapping_slices)):
             # get the substack
             substack = self.vfv[z_slice, y_slice, x_slice] # [xbatch, ybatch, 2048]
@@ -482,11 +482,12 @@ class VirtualFusedVolumeVoronoiSegmenter:
                 stack_slices=(z_slice, y_slice, x_slice),
                 start_label=start_label)
 
-            z_border = self.z_overlap if idx < len(z_overlapping_slices) else None
+            z_border = self.z_overlap if idx < len(z_overlapping_slices) -1 else None
             y_border = self.y_overlap if y_slice.stop != self.vfv.shape[1] else None
 
-            sub_path = self._save_substack(segmented_substack, z_border=z_border, y_border=y_border, offset=offset_unscaled)
-            self.filematrix_dict[(0,*offset_unscaled[1:])] = sub_path
+            sub_path, sub_arr_shape = self._save_substack(segmented_substack, z_border=z_border, y_border=y_border, offset=offset_unscaled)
+            sub_arr_shapes.append(sub_arr_shape)
+
             # get the overlap
             if y_overlap_arr_upper is not None:
                 # we want to avoid discarding the upper border for the last slice
@@ -508,7 +509,13 @@ class VirtualFusedVolumeVoronoiSegmenter:
                 start_label = np.uint32(z_slice_df.label.max() + 1) if "label" in z_slice_df else 1
                 # this should roll when we get to uint32.max
 
-        return z_slice_df, y_overlap_arr_upper, y_overlap_arr_lower
+        shapes_arr = np.array(sub_arr_shapes)
+        z_length = np.sum(shapes_arr, axis=0)[0]
+        saved_substack_shape = (z_length, shapes_arr[0, 1], shapes_arr[0, 2])
+        assert z_length == self.vfv.shape[0], f"lengths[0] ({z_length}) != self.vfv.shape[0] ({self.vfv.shape[0]})"
+        assert len(list(sub_path.glob("*.tif"))) == self.vfv.shape[0], "not all z slices were saved"
+        self.filematrix_dict[(0,*offset_unscaled[1:])] = sub_path, saved_substack_shape
+        return z_slice_df, y_overlap_arr_upper, y_overlap_arr_lower, saved_substack_shape
 
     
     @staticmethod
@@ -582,7 +589,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
                 tifffile.imwrite(str(out_fpath.joinpath("{:06d}.tif".format(idx+offset[0]))), img, compression="zlib")
             end = time.time()
             print(f"writing substack to disk took {end-start:.2f}s")
-        return out_fpath
+
+        return out_fpath, substack.shape
 
 
     def segment_vfv(self) -> Tuple[pd.DataFrame,VirtualFusedVolume]:
@@ -612,11 +620,13 @@ class VirtualFusedVolumeVoronoiSegmenter:
         start_label = 0
         y_overlap_df_upper = None
         previous_y_overlap_arr_upper = None
+        saved_stack_shapes = []
         for idx, y_slice in enumerate(overlapping_y_slices):
             print(f"Segmenting y-stack {idx}/{len(overlapping_y_slices)}..." )
             previous_y_overlap_arr_upper = None
-            stack_df, y_overlap_arr_upper, y_overlap_arr_lower = self._segment_z_stack(y_slice, start_label=start_label)
+            stack_df, y_overlap_arr_upper, y_overlap_arr_lower, saved_stack_shape = self._segment_z_stack(y_slice, start_label=start_label)
 
+            saved_stack_shapes.append(saved_stack_shape)
             y_overlap_df_upper = self._get_overlap_df(stack_df, self.vfv.shape, self.y_overlap, mode="upper")
             y_overlap_df_lower = self._get_overlap_df(stack_df, self.vfv.shape, self.y_overlap, mode="lower")
 
@@ -644,29 +654,35 @@ class VirtualFusedVolumeVoronoiSegmenter:
                 previous_y_overlap_arr_upper = y_overlap_arr_upper
                 previous_y_overlap_df_upper = y_overlap_df_upper.copy()
 
-        self.write_out_stitchfile()
 
+        y_stack_shapes_arr = np.array(saved_stack_shapes)
+        y_len = np.sum(y_stack_shapes_arr[:, 1])
+        assert y_len == self.vfv.shape[1], f"y_len {y_len} != vfv.shape[1] {self.vfv.shape[1]}"
+
+        out_vfv = self.write_out_stitchfile()
+        assert out_vfv.shape == self.vfv.shape, f"out_vfv.shape {out_vfv.shape} != vfv.shape {self.vfv.shape}"
         if self.out_csv_path.exists():
             self.out_csv_path.unlink()
         vfv_df.to_csv(self.out_csv_path)
-        return VirtualFusedVolume(str(self.out_stitchfile_path)), vfv_df
+        return out_vfv, vfv_df
 
-    def write_out_stitchfile(self):
+    def write_out_stitchfile(self) -> VirtualFusedVolume:
         if self.out_stitchfile_path.exists():
             self.out_stitchfile_path.unlink()
         filedicts = []
-        for offset, fpath in self.filematrix_dict.items():
+        for offset, out_arr_tuple in self.filematrix_dict.items():
+            fpath, out_arr_shape = out_arr_tuple
             fpaths = [fpath for fpath in fpath.glob("*.tif")]
             first_frame = skio.imread(fpaths[0])
 
             filedicts.append({
                 "filename": str(fpath.relative_to(self.output_path)),
-                "X": offset[2],
-                "Xs": 0,
-                "Y": offset[1],
-                "Ys": 0,
-                "Z": offset[0],
-                "Zs": 0,
+                "Xs": offset[2],
+                "X": offset[2]*self.voxel_size[2]/1e3,
+                "Ys": offset[1],
+                "Y": offset[1]*self.voxel_size[1]/1e3,
+                "Zs": offset[0],
+                "Z": offset[0]*self.voxel_size[0]/1e3,
                 "nfrms": len(fpaths),
                 "xsize": first_frame.shape[1],
                 "ysize": first_frame.shape[0]}
@@ -674,6 +690,9 @@ class VirtualFusedVolumeVoronoiSegmenter:
 
         with self.out_stitchfile_path.open(mode="w") as f:
             yaml.safe_dump({"filematrix": filedicts}, f)
+
+        out_vfv = VirtualFusedVolume(str(self.out_stitchfile_path))
+        return out_vfv
 
 def main():
     parser = ArgumentParser()
@@ -729,6 +748,7 @@ def main():
 
 
     segm_vfv, segm_df = segm.segment_vfv()
+    print("ciao")
 
 if __name__ == "__main__":
     main()

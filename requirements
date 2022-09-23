@@ -1,0 +1,8 @@
+numpy
+pandas
+networkx
+tqdm
+scikit-image>=0.20.0.dev0
+tifffile
+pyclesperanto_prototype
+zetastitcher>=0.7.0.post1
