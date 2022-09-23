@@ -17,7 +17,7 @@ RUN python -m venv instancesegmenter_env && . instancesegmenter_env/bin/activate
 RUN git clone https://github.com/scikit-image/scikit-image.git && cd scikit-image && pip install -r requirements.txt && pip install -e . && cd ../
 
 # installing my fork of ZetaStitcher
-RUN git clone git@github.com:filippocastelli/ZetaStitcher.git && cd ZetaStitcher && pip install -r requirements.txt && pip install -e . && cd ../
+RUN git clone https://github.com/filippocastelli/ZetaStitcher.git && cd ZetaStitcher && pip install -r requirements.txt && pip install -e . && cd ../
 
 #COPY requirements /requirements
 #RUN pip install -r /requirements && rm /requirements && rm -rf /root/.cache/pip/
