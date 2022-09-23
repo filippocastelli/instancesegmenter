@@ -691,7 +691,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
         with self.out_stitchfile_path.open(mode="w") as f:
             yaml.safe_dump({"filematrix": filedicts}, f)
 
-        out_vfv = VirtualFusedVolume(str(self.out_stitchfile_path))
+        out_vfv = VirtualFusedVolume(str(self.out_stitchfile_path),weighting_mode="none")
         return out_vfv
 
 def main():
@@ -748,7 +748,6 @@ def main():
 
 
     segm_vfv, segm_df = segm.segment_vfv()
-    print("ciao")
 
 if __name__ == "__main__":
     main()
