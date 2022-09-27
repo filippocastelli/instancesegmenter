@@ -55,11 +55,18 @@ COL_DTYPES["inertia_tensor_eigvecs"] = float
 PROPS["inertia_tensor_eigvecs"] = "inertia_tensor_eigvecs"
 
 # extra properties
-def n_slices(img: np.ndarray) -> int:
-    return img.shape[0]
+def n_slices(self) -> int:
+    return self.image.shape[0]
 
-def label_uuid(img: np.ndarray) -> str:
+RegionProperties.n_slices = property(n_slices)
+COL_DTYPES["n_slices"] = str
+PROPS["n_slices"] = "n_slices"
+
+def label_uuid(self) -> str:
     return str(uuid.uuid4())
+RegionProperties.uuid = property(label_uuid)
+COL_DTYPES["uuid"] = str
+PROPS["uuid"] = "uuid"
 
 props = [
     "label",
@@ -79,7 +86,9 @@ props = [
     "moments_central",
     "slice",
     "major_axis_length",
-    "err_minor_axis_length"
+    "err_minor_axis_length",
+    "n_slices",
+    #"uuid"
 ]
 
 class SharedNumpyArray:
@@ -341,14 +350,30 @@ class VirtualFusedVolumeVoronoiSegmenter:
             n_overlap=n_overlap,
             offset_unscaled=offset_unscaled,
             shear_shift=shear_shift,
-            stack_slices=stack_slices)
+            stack_slices=stack_slices,
+            crop_offset=cropper.pads[2][0])
+
 
         segmented_stack_arr = shearing_corrector.inverse_correct(segmented_stack_arr)
         if autocrop: 
             segmented_stack_arr = cropper.uncrop(segmented_stack_arr)
 
+        DEBUG_PLOTS= False
+        if DEBUG_PLOTS:
+            from matplotlib import pylab as plt
+            
+            arr_0, arr_1 = cls._get_centroids_by_z(segmented_df, 8, .5, key="centroid_stack_unsheared_unscaled", xoff=0)
+            fig, ax = plt.subplots(1, 2)
+            ax[0].imshow(segmented_stack_arr[8])
+            ax[1].imshow(segmented_stack_arr[8])
+            ax[1].scatter(arr_1, arr_0, c='r')
         return segmented_stack_arr, segmented_df
-
+    @staticmethod
+    def _get_centroids_by_z(df: pd.DataFrame, z: int, delta: int, key="centroid_stack_unsheared_unscaled", xoff = -351) -> tuple:
+        slice_df = df[df[f"{key}-0"] > z-delta ][df[f"{key}-0"] < z+delta]
+        arr_0 = slice_df[f"{key}-1"].values
+        arr_1 = slice_df[f"{key}-2"].values + xoff
+        return arr_0, arr_1
     @classmethod
     def _get_stack_df(cls,
         segmented_stack: np.ndarray,
@@ -356,18 +381,34 @@ class VirtualFusedVolumeVoronoiSegmenter:
         n_overlap: int = 0,
         offset_unscaled: tuple = None,
         shear_shift: int = 0,
-        stack_slices: tuple = None) -> pd.DataFrame:
+        stack_slices: tuple = None,
+        crop_offset: int = None) -> pd.DataFrame:
 
-        rprops = regionprops(segmented_stack, extra_properties=[n_slices, label_uuid], spacing=voxel_size)
+        rprops = regionprops(segmented_stack, spacing=voxel_size)
         if len(rprops) > 0:
             rprops_dict = _props_to_dict(rprops, properties=props)
             stack_df = pd.DataFrame(rprops_dict)
             stack_df = stack_df[stack_df.label != 0]
-            stack_df.rename({"err_minor_axis_length": "minor_axis_length"}, inplace=True)
+            stack_df.rename(columns={"err_minor_axis_length": "minor_axis_length"}, inplace=True)
+            stack_df['uuid'] = stack_df.apply(lambda _: uuid.uuid4(), axis=1)
             
+            # creating stack sheared column
+            for i in range(3):
+                stack_df.rename(columns={f"centroid_unscaled-{i}": f"centroid_stack_sheared_unscaled-{i}"}, inplace=True)
+                stack_df.rename(columns={f"centroid-{i}": f"centroid_stack_sheared_scaled-{i}"}, inplace=True)
+            
+            get_cols_partial = partial(cls._get_coords_df_row,
+                shear_shift=shear_shift,
+                crop_offset_x=crop_offset,
+                global_offset=offset_unscaled,
+                voxel_size=voxel_size,
+                arr_depth=segmented_stack.shape[0])
+
+            stack_df = stack_df.join(stack_df.apply(get_cols_partial, axis=1))
+
             if n_overlap > 0:
                 # dropping neurons in the upper overlap area
-                stack_df = stack_df[stack_df["centroid_unscaled-0"] < segmented_stack.shape[0] - n_overlap]
+                stack_df = stack_df[stack_df["centroid_stack_unsheared_unscaled-0"] < segmented_stack.shape[0] - n_overlap]
                 # no point in 
                 return stack_df
             
@@ -376,47 +417,122 @@ class VirtualFusedVolumeVoronoiSegmenter:
             if stack_slices is not None:
                 for i in range(3):
                     stack_df[f"vfv_slices-{i}"] = stack_slices[i]
-
-            if offset_unscaled is not None:
-                # add the offset to the centroid
-                
-                # saving the centroid referred to the original sheared and unsheared stack
-                for i in range(3):
-                    stack_df[f"centroid_stack_sheared-{i}"] = stack_df[f"centroid_unscaled-{i}"].copy()
-                
-                # centroid-i refers to the scaled centroid in the shearing transformed stack
-                # so it's in the right geometry but it's not in the right position
-                # we need to add the offset to it
-                
-                # we have an already scaled centroid but the offset is not scaled
-                sheared_offset_unscaled = cls._shear_coord(offset_unscaled, shear_shift)
-                scaled_sheared_offset = [voxel_size[i]*sheared_offset_unscaled[i] for i in range(3)]
-                # now we can add the offset to the scaled centroid so it should be in the right position
-                # in the voxel scaled sheared vfv coordinate system
-                for i in range(3):
-                    stack_df[f"centroid-{i}"] += scaled_sheared_offset[i]
-                
-                # we also have an unscaled centroid that's in the right geometry but it's not in the right position
-                # we need to add the offset to it
-                for i in range(3):
-                    stack_df[f"centroid_unscaled-{i}"] += sheared_offset_unscaled[i]
-                    #stack_df[f"centroid_unscaled_unsheared-{i}"] = stack_df[f"centroid_unscaled-{i}"].copy()
-                    #stack_df[f"centroid_unscaled_unsheared-{i}"].apply(lambda x: cls._shear_coord_row(x, shear_shift, back_transform=True))
-                
-                unshear_partial = partial(cls._shear_coord_row, shear_shift=shear_shift)
-                stack_df = stack_df.join(stack_df.apply(unshear_partial, axis=1))
-                # now we have the centroid in the right position in the unscaled voxel coordinate system
-                # of the sheared stack
         else:
             stack_df = pd.DataFrame()
 
         return stack_df
+    # @classmethod
+    # def _get_stack_df_old(cls,
+    #     segmented_stack: np.ndarray,
+    #     voxel_size: tuple = (3.6, 0.52, 0.52),
+    #     n_overlap: int = 0,
+    #     offset_unscaled: tuple = None,
+    #     shear_shift: int = 0,
+    #     stack_slices: tuple = None) -> pd.DataFrame:
+
+    #     rprops = regionprops(segmented_stack, extra_properties=[n_slices, label_uuid], spacing=voxel_size)
+    #     if len(rprops) > 0:
+    #         rprops_dict = _props_to_dict(rprops, properties=props)
+    #         stack_df = pd.DataFrame(rprops_dict)
+    #         stack_df = stack_df[stack_df.label != 0]
+    #         stack_df.rename({"err_minor_axis_length": "minor_axis_length"}, inplace=True)
+            
+    #         for i in range(3):
+    #             stack_df.rename(f"centroid_unscaled-{i}", f"centroid_stack_unsheared-{i}", inplace=True)
+            
+    #         if n_overlap > 0:
+    #             # dropping neurons in the upper overlap area
+    #             stack_df = stack_df[stack_df["centroid_stack_unsheared-0"] < segmented_stack.shape[0] - n_overlap]
+    #             # no point in 
+    #             return stack_df
+            
+    #         # we include the original slices in case we need to retrieve the original stack
+    #         # all local coords should refer to the original sheared stack
+    #         if stack_slices is not None:
+    #             for i in range(3):
+    #                 stack_df[f"vfv_slices-{i}"] = stack_slices[i]
+
+    #         if offset_unscaled is not None:
+    #             # add the offset to the centroid
+                
+    #             # saving the centroid referred to the original sheared and unsheared stack
+    #             for i in range(3):
+    #                 stack_df[f"centroid_stack_sheared-{i}"] = stack_df[f"centroid_stack_unsheared-{i}"].copy()
+                
+    #             # centroid-i refers to the scaled centroid in the shearing transformed stack
+    #             # so it's in the right geometry but it's not in the right position
+    #             # we need to add the offset to it
+                
+    #             # we have an already scaled centroid but the offset is not scaled
+    #             sheared_offset_unscaled = cls._shear_coord(offset_unscaled, shear_shift)
+    #             scaled_sheared_offset = [voxel_size[i]*sheared_offset_unscaled[i] for i in range(3)]
+    #             # now we can add the offset to the scaled centroid so it should be in the right position
+    #             # in the voxel scaled sheared vfv coordinate system
+    #             for i in range(3):
+    #                 stack_df[f"centroid-{i}"] -= scaled_sheared_offset[i]
+                
+    #             # we also have an unscaled centroid that's in the right geometry but it's not in the right position
+    #             # we need to add the offset to it
+    #             for i in range(3):
+    #                 stack_df[f"centroid_stack_unsheared-{i}"] -= sheared_offset_unscaled[i]
+    #                 #stack_df[f"centroid_unscaled_unsheared-{i}"] = stack_df[f"centroid_unscaled-{i}"].copy()
+    #                 #stack_df[f"centroid_unscaled_unsheared-{i}"].apply(lambda x: cls._shear_coord_row(x, shear_shift, back_transform=True))
+                
+    #             unshear_partial = partial(cls._shear_coord_row, shear_shift=shear_shift)
+    #             stack_df = stack_df.join(stack_df.apply(unshear_partial, axis=1))
+    #             # now we have the centroid in the right position in the unscaled voxel coordinate system
+    #             # of the sheared stack
+    #     else:
+    #         stack_df = pd.DataFrame()
+
+    #     return stack_df
 
     @classmethod
+    def _get_coords_df_row(cls, df_row, shear_shift, crop_offset_x, global_offset, voxel_size, arr_depth):
+        coord_tuple = (df_row["centroid_stack_sheared_unscaled-0"], df_row["centroid_stack_sheared_unscaled-1"], df_row["centroid_stack_sheared_unscaled-2"])
+        
+        label_list = []
+        value_list = []
+
+        stack_cropped_sheared = list(coord_tuple)
+        stack_cropped_unsheared = list(cls._shear_coord(stack_cropped_sheared, shear_shift, back_transform=True))
+
+        #for i in range(3):
+        #    label_list.append(["centroid_stack_unsheared_crop-{}".format(i)])
+        #    value_list.append([stack_cropped_unsheared[i]])
+
+        stack_uncropped_unsheared = stack_cropped_unsheared.copy()
+        stack_uncropped_unsheared[2] += crop_offset_x + arr_depth*shear_shift
+
+        for i in range(3):
+            label_list.append("centroid_stack_unsheared_unscaled-{}".format(i))
+            value_list.append(stack_uncropped_unsheared[i])
+
+        global_uncropped_unsheared = stack_uncropped_unsheared.copy()
+        for i in range(3):
+            global_uncropped_unsheared[i] += global_offset[i]
+            label_list.append("centroid_global_unsheared_unscaled-{}".format(i))
+            value_list.append(global_uncropped_unsheared[i])
+        
+        global_uncropped_sheared = global_uncropped_unsheared.copy()
+        global_uncropped_sheared = cls._shear_coord(global_uncropped_sheared, shear_shift, back_transform=False)
+        for i in range(3):
+            label_list.append("centroid_global_sheared_unscaled-{}".format(i))
+            value_list.append(global_uncropped_sheared[i])
+
+        global_uncropped_unsheared_scaled = global_uncropped_unsheared.copy()
+        for i in range(3):
+            global_uncropped_unsheared_scaled[i] *= voxel_size[i]
+            label_list.append("centroid_global_unsheared_scaled-{}".format(i))
+            value_list.append(global_uncropped_unsheared_scaled[i])
+
+        return pd.Series(value_list, index=label_list)
+        
+    @classmethod
     def _shear_coord_row(cls, df_row, shear_shift):
-        coord_tuple = (df_row["centroid_unscaled-0"], df_row["centroid_unscaled-1"], df_row["centroid_unscaled-2"])
+        coord_tuple = (df_row["centroid_stack_sheared_unscaled-0"], df_row["centroid_stack_sheared_unscaled-1"], df_row["centroid_stack_sheared_unscaled-2"])
         sheared_coord_list = list(cls._shear_coord(coord_tuple, shear_shift, back_transform=True))
-        return pd.Series(sheared_coord_list, index=["centroid_unscaled_unsheared-0", "centroid_unscaled_unsheared-1", "centroid_unscaled_unsheared-2"])
+        return pd.Series(sheared_coord_list, index=["centroid_stack_unsheared_unscaled-0", "centroid_stack_unsheared_unscaled-1", "centroid_stack_unsheared_unscaled-2"])
 
     @staticmethod
     def _get_overlapping_slices(range_len: int, batch_size: int, overlap: int) -> slice:
@@ -445,9 +561,9 @@ class VirtualFusedVolumeVoronoiSegmenter:
         if mode == "upper":
             # select only centroids in the upper overlap
             # we need to drop all centroids that are in the lower overlap
-            overlap_df = overlap_df[overlap_df[f"centroid_unscaled_unsheared-1"] > vfv_shape[1] - y_overlap]
+            overlap_df = overlap_df[overlap_df[f"centroid_global_unsheared_unscaled-1"] > vfv_shape[1] - y_overlap]
         elif mode == "lower":
-            overlap_df = overlap_df[overlap_df[f"centroid_unscaled_unsheared-1"] < y_overlap]
+            overlap_df = overlap_df[overlap_df[f"centroid_global_unsheared_unscaled-1"] < y_overlap]
 
         # if we've done everything right, centroids should share the same coordinates in the overlap
         return overlap_df
@@ -503,8 +619,6 @@ class VirtualFusedVolumeVoronoiSegmenter:
             # add the substack df to the stack df
             z_slice_df = pd.concat([z_slice_df, substack_df], ignore_index=True)
             # DATAFRAME REFERS TO THE SHEARING_CORRECTED STACK
-
-            z_slice_df = pd.concat([z_slice_df, substack_df])
             if idx > 0:
                 start_label = np.uint32(z_slice_df.label.max() + 1) if "label" in z_slice_df else 1
                 # this should roll when we get to uint32.max
@@ -642,15 +756,18 @@ class VirtualFusedVolumeVoronoiSegmenter:
                     
                     for label_tuple in matching:
                         label_stack, label_vfv = label_tuple
-                        uuid_vfv = vfv_df["uuid"][vfv_df["label"] == label_vfv].values[0]
+                        uuiddf = vfv_df["uuid"][vfv_df["label"] == label_vfv]
+                        uuid_vfv = uuiddf.iloc[0]
                         stack_df.loc[stack_df["label"] == label_stack, "uuid"] = uuid_vfv
                         stack_df.loc[stack_df["label"] == label_stack, "label"] = label_vfv
                     
                     # drop vfv uuids in the overlap region
                     # if we're in the last slice, we don't need to drop anything
-                    if idx != len(overlapping_y_slices):
-                        vfv_df = vfv_df[vfv_df["centroid_unscaled-0"] < y_slice.end - self.y_overlap]
+            if idx != len(overlapping_y_slices):
+                if len(vfv_df) > 0:
+                    vfv_df = vfv_df[vfv_df["centroid_global_unsheared_unscaled-1"] < y_slice.stop - self.y_overlap]
                 vfv_df = pd.concat([vfv_df, stack_df])
+
                 previous_y_overlap_arr_upper = y_overlap_arr_upper
                 previous_y_overlap_df_upper = y_overlap_df_upper.copy()
 
