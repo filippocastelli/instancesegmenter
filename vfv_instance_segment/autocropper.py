@@ -7,7 +7,8 @@ class AutoCropper:
         self.vol = vol
         self.grad_threshold = grad_threshold
         self.autocrop_range = self._get_autocrop_range(self.vol, self.grad_threshold)
-
+        self.pads = self._get_pads(self.autocrop_range, self.vol.shape)
+    
     def crop(self):
         """
         Crops the volume according to the autocrop range.
@@ -26,6 +27,10 @@ class AutoCropper:
         uncropped_vol[:, :, self.autocrop_range[0]:self.autocrop_range[1]] = vol
         return uncropped_vol
 
+    @staticmethod
+    def _get_pads(autocrop_range: tuple, vol_shape: tuple):
+        return (0, 0), (0, 0), (autocrop_range[0], vol_shape[2] - autocrop_range[1])
+        
     @staticmethod
     def _get_autocrop_range(vol: np.ndarray, grad_threshold:float=0.01):
         """
