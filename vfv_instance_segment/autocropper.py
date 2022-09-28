@@ -23,7 +23,7 @@ class AutoCropper:
         :param vol: 3D volume
         :return: uncropped volume
         """
-        uncropped_vol = np.zeros(self.vol.shape)
+        uncropped_vol = np.zeros(self.vol.shape, dtype=vol.dtype)
         uncropped_vol[:, :, self.autocrop_range[0]:self.autocrop_range[1]] = vol
         return uncropped_vol
 
