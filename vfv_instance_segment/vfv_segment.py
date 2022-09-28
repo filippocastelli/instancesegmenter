@@ -158,7 +158,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
         voxel_size: tuple = (3.64, 0.52, 0.52),
         n_workers: int = -1,
         n_saving_workers: int = -1,
-        df_light_cols: list = None
+        df_light_cols: list = None,
+        resume: bool = False,
         ):
 
         self.in_fpath = in_fpath
@@ -196,6 +197,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
         self.n_workers = n_workers if n_workers > 0 else multiprocessing.cpu_count()
         self.n_saving_workers = n_saving_workers if n_saving_workers > 0 else multiprocessing.cpu_count()
         self.df_light_cols = df_light_cols if df_light_cols is not None else DF_LIGHT_COLS
+
+        self.resume = resume
 
     @staticmethod
     def _get_volume_slices(
@@ -723,6 +726,10 @@ class VirtualFusedVolumeVoronoiSegmenter:
         
         return True
     
+    @staticmethod
+    def _get_stack_fname(offset: tuple) -> str:
+        return f"z_{0:06d}_y_{offset[1]:06d}_x_{offset[2]:06d}"
+    
     def _save_substack(self,
         substack: np.ndarray,
         z_border: int = None,
@@ -731,7 +738,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
 
         #out_fname = f"z_{offset[0]:06d}_y_{offset[1]:06d}_x_{offset[2]:06d}"
         # saving in same z folders so we have complete z-stacks
-        out_fname = f"z_{0:06d}_y_{offset[1]:06d}_x_{offset[2]:06d}"
+        out_fname = self._get_stack_fname(offset)
         out_fpath = self.output_path.joinpath(out_fname)
         out_fpath.mkdir(parents=True, exist_ok=True)
 
@@ -835,11 +842,30 @@ class VirtualFusedVolumeVoronoiSegmenter:
         y_overlap_df_upper = None
         previous_y_overlap_arr_upper = None
         saved_stack_shapes = []
+
         for idx, y_slice in enumerate(overlapping_y_slices):
             print(f"Segmenting y-stack {idx}/{len(overlapping_y_slices)-1}..." )
-            stack_df, y_overlap_arr_upper, y_overlap_arr_lower, saved_stack_shape = self._segment_z_stack(y_slice, start_label=start_label)
-            #def _get_overlap_df(df: pd.DataFrame, stack_offset: tuple, z_stack_shape: tuple, overlap_size: int, mode="upper") -> pd.DataFrame:
-            saved_stack_shapes.append(saved_stack_shape)
+            
+            out_stack_fname = self._get_stack_fname((0, y_slice.start, 0))
+            out_stack_fpath = self.output_path.joinpath(out_stack_fname)
+            df_bck_path = self.out_csv_path.parent.joinpath(f"df_bck_{idx}.csv")
+
+            if self.resume and out_stack_fpath.exists() and len(list(out_stack_fpath.glob("*.tif"))) == self.vfv.shape[0] and df_bck_path.exists():
+                print("Skipping y-stack prediction...")
+                prev_stack_inpf = InputFile(out_stack_fpath)
+                saved_stack_shape = prev_stack_inpf.shape
+                self.filematrix_dict[(0,y_slice.start, 0)] = out_stack_fpath, saved_stack_shape
+                saved_stack_shapes.append(prev_stack_inpf.shape)
+                
+                y_border = self.y_overlap if y_slice.stop != self.vfv.shape[1] else None
+                previous_y_overlap_arr_upper = prev_stack_inpf[-y_border:,:] if y_border is not None else prev_stack_inpf[:]
+                stack_df = pd.read_csv(df_bck_path)
+
+            else:
+                stack_df, y_overlap_arr_upper, y_overlap_arr_lower, saved_stack_shape = self._segment_z_stack(y_slice, start_label=start_label)
+                #def _get_overlap_df(df: pd.DataFrame, stack_offset: tuple, z_stack_shape: tuple, overlap_size: int, mode="upper") -> pd.DataFrame:
+                saved_stack_shapes.append(saved_stack_shape)
+            
             y_overlap_df_upper = self._get_overlap_df(stack_df,
                 y_offset=y_slice.start,
                 y_depth=saved_stack_shape[1],
@@ -880,6 +906,9 @@ class VirtualFusedVolumeVoronoiSegmenter:
                 previous_y_overlap_arr_upper = y_overlap_arr_upper
                 previous_y_overlap_df_upper = y_overlap_df_upper.copy()
 
+            # saving backup of dataframe for each stack
+            self._save_df(stack_df, df_bck_path)
+
 
         y_stack_shapes_arr = np.array(saved_stack_shapes)
         y_len = np.sum(y_stack_shapes_arr[:, 1])
@@ -887,13 +916,15 @@ class VirtualFusedVolumeVoronoiSegmenter:
 
         out_vfv = self.write_out_stitchfile()
         assert out_vfv.shape == self.vfv.shape, f"out_vfv.shape {out_vfv.shape} != vfv.shape {self.vfv.shape}"
-        if self.out_csv_path.exists():
-            self.out_csv_path.unlink()
-        vfv_df.to_csv(self.out_csv_path)
-
-        light_vfv_df = vfv_df[self.df_light_cols]
-        light_vfv_df.to_csv(self.out_csv_path.with_suffix(".light.csv"))
+        self._save_df(vfv_df, path=self.out_csv_path)
         return out_vfv, vfv_df
+
+    def _save_df(self, df: pd.DataFrame, path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        df.to_csv(path)
+        light_df = df[self.df_light_cols]
+        light_df.to_csv(path.with_suffix(".light.csv"))
 
     def write_out_stitchfile(self) -> VirtualFusedVolume:
         if self.out_stitchfile_path.exists():
@@ -940,6 +971,7 @@ def main():
     parser.add_argument('-vz', '--voxel-size-z', dest='voxelsizez', type=float, default=3.6, help="voxel size z", required=False)
     parser.add_argument('-nw', '--n-workers', dest='nworkers', type=int, default=1, help="number of workers", required=False)
     parser.add_argument('-nsw', '--n-saving-workers', dest='nsavingworkers', type=int, default=1, help="number of workers for saving", required=False)
+    parser.add_argument('-r', '--resume', dest='resume', action='store_true', help="resume", required=False)
     #parser.add_argument('-s', '--start', dest='start', help='start index', default=0, required=False)
     #parser.add_argument('-e', '--end', dest='end', help='end index', default=-1, required=False)
 
@@ -962,6 +994,7 @@ def main():
     n_workers = int(args.nworkers)
     n_saving_workers = int(args.nsavingworkers)
     y_matching_batch_size = int(args.ymatchingbatch)
+    resume = bool(args.resume)
 
 
 
@@ -979,7 +1012,8 @@ def main():
         voxel_size=(voxel_size_z, voxel_size_xy, voxel_size_xy),
         n_workers=n_workers,
         n_saving_workers=n_saving_workers,
-        y_matching_batch_size=y_matching_batch_size)
+        y_matching_batch_size=y_matching_batch_size,
+        resume=resume)
 
 
     segm_vfv, segm_df = segm.segment_vfv()
