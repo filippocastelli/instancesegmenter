@@ -2,6 +2,7 @@ numpy
 pandas
 networkx
 tqdm
+enlighten
 scikit-image>=0.20.0.dev0
 tifffile
 pyclesperanto_prototype
