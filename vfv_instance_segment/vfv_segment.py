@@ -25,6 +25,7 @@ from skimage import io as skio
 import tifffile
 import pyclesperanto_prototype as cle
 from zetastitcher import VirtualFusedVolume, InputFile
+import enlighten
 
 from vfv_instance_segment.autocropper import AutoCropper
 from vfv_instance_segment.integershearingcorrect import IntegerShearingCorrect
@@ -120,21 +121,23 @@ DF_LIGHT_COLS = [
     "extent"
 ]
 class SharedNumpyArray:
-    def __init__(self, arr: np.ndarray, name: str = "shnp"):
+    def __init__(self, arr: np.ndarray, name: str = "shnp", verbose: bool = False):
         self.arr = arr
         self.dtype = arr.dtype
         self.shape = arr.shape
         self.dsize = np.dtype(arr.dtype).itemsize * np.prod(self.shape)
         self.name = f"{name}_{uuid.uuid4()}"
         self.dst = None
+        self.verbose = verbose
         self.get_shm()
 
     def get_shm(self):
         self.shm = shared_memory.SharedMemory(create=True, size=self.dsize, name=self.name)
         self.dst = np.ndarray(self.shape, dtype=self.dtype, buffer=self.shm.buf)
         self.dst[:] = self.arr[:]
-        print(f"created shared array {self.shm.name} with shape {self.shape} and dtype {self.dtype}")
-        print(f"size: {(self.dst.nbytes / 1024) / 1024} MB")
+        if self.verbose:
+            print(f"created shared array {self.shm.name} with shape {self.shape} and dtype {self.dtype}")
+            print(f"size: {(self.dst.nbytes / 1024) / 1024} MB\n")
 
     def release(self):
         self.shm.close()
@@ -209,6 +212,9 @@ class VirtualFusedVolumeVoronoiSegmenter:
         """
         Given a volume and a label, return the slices that contain the label.
         """
+        if df is None:
+            return slice(None), slice(None), slice(None)
+            
         # get the label
         label = int(label_str.split("_")[0])
 
@@ -282,7 +288,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
         overlap: np.ndarray,
         df_stack: pd.DataFrame = None,
         df_overlap: pd.DataFrame = None,
-        n_workers: int = 1) -> list:
+        n_workers: int = 1,
+        progress_bar: bool = False) -> list:
         """
         Get best matching labels between the stack and the overlap
         :param stack: the stack to get the overlap from
@@ -318,7 +325,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
         
         enable_df_search = df_overlap is not None and df_stack is not None
         
-        if n_workers > 1 and enable_df_search:
+        if n_workers > 1:
+            start_time = time.time()
             shared_stack = SharedNumpyArray(stack, name="sh_stack_matching")
             shared_overlap = SharedNumpyArray(overlap, name="sh_overlap_matching")
 
@@ -354,10 +362,17 @@ class VirtualFusedVolumeVoronoiSegmenter:
             
             shared_stack.release()
             shared_overlap.release()
+            end_time = time.time()
+            elapsed = end_time - start_time
+            per_label = elapsed / (len(stack_labels) * len(overlap_labels))
+            print(f"Multithread matching took {elapsed:.4f} seconds, {per_label:.4f} seconds per label pair")
             
         else:
+            start_time = time.time()
         # can possibly be parallelized using multiprocessing
-            for i, label_o_str in enumerate(overlap_labels_str):
+            print(f"Starting single threaded label matching, {len(overlap_labels_str)} overlap labels")
+            iterable = overlap_labels_str if not progress_bar else tqdm(overlap_labels_str)
+            for i, label_o_str in enumerate(iterable):
                 label_o = overlap_labels[i]
                 for j, label_s_str in enumerate(stack_labels_str):
                     label_s = stack_labels[j]
@@ -372,7 +387,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
                         n_intersect = np.sum(intersect_arr[overlap_arr==label_o])
                     else:
                         n_intersect = np.sum(intersection[overlap==label_o])
-
+                        #n_intersect = len(np.where(overlap==label_o))
                     if n_intersect > 0:
                         if df_overlap is not None and df_stack is not None:
                             binarized_stack_arr = binarized_stack[centroid_slices[0], centroid_slices[1], centroid_slices[2]]
@@ -392,6 +407,11 @@ class VirtualFusedVolumeVoronoiSegmenter:
                     else:
                         jaccard_index = 0
                         pass
+
+            end_time = time.time()
+            elapsed = end_time - start_time
+            per_label = elapsed / (len(stack_labels) * len(overlap_labels))
+            print(f"Single threaded matching took {elapsed:.4f} seconds, {per_label:.4f} seconds per label pair")
 
         label_graph.add_weighted_edges_from(edge_list)
         matching = nx.max_weight_matching(label_graph, maxcardinality=True)
@@ -655,7 +675,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
 
         start_label = start_label if start_label is not None else 1
         sub_arr_shapes = []
-        for idx, z_slice in enumerate(tqdm(z_overlapping_slices)):
+        tocks = self.progressbar_manager.counter(total=len(z_overlapping_slices),  desc="Z-Stacks", unit="z-stack", color="blue")
+        for idx, z_slice in enumerate(z_overlapping_slices):
             # get the substack
             substack = self.vfv[z_slice, y_slice, x_slice] # [xbatch, ybatch, 2048]
             # segment the substack
@@ -675,30 +696,36 @@ class VirtualFusedVolumeVoronoiSegmenter:
                 n_workers=self.n_workers)
 
             z_border = self.z_overlap if idx < len(z_overlapping_slices) -1 else None
-            y_border = self.y_overlap if y_slice.stop != self.vfv.shape[1] else None
+            y_border = self.y_overlap if y_slice.stop != self.vfv.shape[1] and self.y_overlap > 0 else None
 
+            z_overlap_arr = segmented_substack[-z_border:] if z_border is not None and z_border!=0 else None
             sub_path, sub_arr_shape = self._save_substack(segmented_substack, z_border=z_border, y_border=y_border, offset=offset_unscaled)
             sub_arr_shapes.append(sub_arr_shape)
+            if y_border is not None:
+                # get the overlap
+                if y_overlap_arr_upper is not None:
+                    # we want to avoid discarding the upper border for the last slice
+                    # y_border is None for the last slice.
+                    y_overlap_arr_upper[z_slice, :, :] = segmented_substack[:, -y_border:, :]
+                if y_overlap_arr_lower is not None:
+                    # we never need to discard the lower border
+                    y_overlap_arr_lower[z_slice, :, :] = segmented_substack[:, :self.y_overlap, :]
+                
+                if y_overlap_arr_upper is not None and y_overlap_arr_lower is not None:
+                    assert y_overlap_arr_lower.shape == y_overlap_arr_upper.shape, f"{y_overlap_arr_lower.shape} != {y_overlap_arr_upper.shape}"
 
-            # get the overlap
-            if y_overlap_arr_upper is not None:
-                # we want to avoid discarding the upper border for the last slice
-                # y_border is None for the last slice.
-                y_overlap_arr_upper[z_slice, :, :] = segmented_substack[:, -y_border:, :]
-            if y_overlap_arr_lower is not None:
-                # we never need to discard the lower border
-                y_overlap_arr_lower[z_slice, :, :] = segmented_substack[:, :self.y_overlap, :]
-            
-            if y_overlap_arr_upper is not None and y_overlap_arr_lower is not None:
-                assert y_overlap_arr_lower.shape == y_overlap_arr_upper.shape, f"{y_overlap_arr_lower.shape} != {y_overlap_arr_upper.shape}"
-
+            else:
+                y_overlap_arr_upper = None
+                y_overlap_arr_lower = None
             # add the substack df to the stack df
+
             z_slice_df = pd.concat([z_slice_df, substack_df], ignore_index=True)
             # DATAFRAME REFERS TO THE SHEARING_CORRECTED STACK
             if idx > 0:
                 start_label = np.uint32(z_slice_df.label.max() + 1) if "label" in z_slice_df else 1
                 # this should roll when we get to uint32.max
-
+            tocks.update()
+        tocks.close()
         shapes_arr = np.array(sub_arr_shapes)
         z_length = np.sum(shapes_arr, axis=0)[0]
         saved_substack_shape = (z_length, shapes_arr[0, 1], shapes_arr[0, 2])
@@ -734,7 +761,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
         substack: np.ndarray,
         z_border: int = None,
         y_border: int = None,
-        offset: tuple = (0,0,0)) -> Path:
+        offset: tuple = (0,0,0),
+        debug: bool = False) -> Path:
 
         #out_fname = f"z_{offset[0]:06d}_y_{offset[1]:06d}_x_{offset[2]:06d}"
         # saving in same z folders so we have complete z-stacks
@@ -774,7 +802,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
             
             shared_np_arr.release()
             end = time.time()
-            print(f"writing substack to disk took {end-start:.2f}s")
+            if debug:
+                print(f"writing substack to disk took {end-start:.2f}s\n")
         else:
             start = time.time()
             for idx, img in enumerate(substack):
@@ -782,7 +811,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
                 #print(img.shape)
                 tifffile.imwrite(str(out_fpath.joinpath("{:06d}.tif".format(idx+offset[0]))), img, compression="zlib")
             end = time.time()
-            print(f"writing substack to disk took {end-start:.2f}s")
+            if debug:
+                print(f"writing substack to disk took {end-start:.2f}s\n")
 
         return out_fpath, substack.shape
 
@@ -797,7 +827,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
 
         slices = cls._get_overlapping_slices(stack.shape[0], batch_size=batch_size, overlap=0)
         global_matching = []
-        print("Calculating y label matching...")
+        print("Calculating y label matching...\n")
         for _slice in tqdm(slices):
             if df_stack is not None and df_overlap is not None:
                 _get_subdf = lambda df, sel_slice : df[df["centroid_global_unsheared_unscaled-0"] > sel_slice.start][df["centroid_global_unsheared_unscaled-0"]< sel_slice.stop]
@@ -842,7 +872,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
         y_overlap_df_upper = None
         previous_y_overlap_arr_upper = None
         saved_stack_shapes = []
-
+        self.progressbar_manager = enlighten.get_manager()
+        ticks = self.progressbar_manager.counter(total=len(overlapping_y_slices), desc="Y-Stacks", unit="y-stack", color="red")
         for idx, y_slice in enumerate(overlapping_y_slices):
             print(f"Segmenting y-stack {idx}/{len(overlapping_y_slices)-1}..." )
             
@@ -858,7 +889,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
                 saved_stack_shapes.append(prev_stack_inpf.shape)
                 
                 y_border = self.y_overlap if y_slice.stop != self.vfv.shape[1] else None
-                previous_y_overlap_arr_upper = prev_stack_inpf[-y_border:,:] if y_border is not None else prev_stack_inpf[:]
+                previous_y_overlap_arr_upper = prev_stack_inpf[slice(None),slice(prev_stack_inpf.shape[1]-y_border, None,1),slice(None)] if y_border is not None else None
                 stack_df = pd.read_csv(df_bck_path)
 
             else:
@@ -866,48 +897,52 @@ class VirtualFusedVolumeVoronoiSegmenter:
                 #def _get_overlap_df(df: pd.DataFrame, stack_offset: tuple, z_stack_shape: tuple, overlap_size: int, mode="upper") -> pd.DataFrame:
                 saved_stack_shapes.append(saved_stack_shape)
             
-            y_overlap_df_upper = self._get_overlap_df(stack_df,
-                y_offset=y_slice.start,
-                y_depth=saved_stack_shape[1],
-                overlap_size=self.y_overlap,
-                mode="upper")
-            y_overlap_df_lower = self._get_overlap_df(stack_df,
-                y_offset=y_slice.start,
-                y_depth=saved_stack_shape[1],
-                overlap_size=self.y_overlap,
-                mode="lower")
+            if self.y_overlap > 0:
+                y_overlap_df_upper = self._get_overlap_df(stack_df,
+                    y_offset=y_slice.start,
+                    y_depth=saved_stack_shape[1],
+                    overlap_size=self.y_overlap,
+                    mode="upper")
+                y_overlap_df_lower = self._get_overlap_df(stack_df,
+                    y_offset=y_slice.start,
+                    y_depth=saved_stack_shape[1],
+                    overlap_size=self.y_overlap,
+                    mode="lower")
+                
+                if y_overlap_arr_lower is not None:
+                    # if we have a previous overlap lower, we need to compute the matching
+                    if previous_y_overlap_arr_upper is not None:
+                        # compute matching between previous overlap lower and current overlap upper
+                        matching = self._get_label_matching(
+                            y_overlap_arr_lower,
+                            previous_y_overlap_arr_upper,
+                            df_stack=y_overlap_df_lower,
+                            df_overlap=previous_y_overlap_df_upper,
+                            n_workers=self.n_workers)
+                            #batch_size=self.y_matching_batch_size)
+                        
+                        for label_tuple in matching:
+                            label_stack, label_vfv = label_tuple
+                            uuiddf = vfv_df["uuid"][vfv_df["label"] == label_vfv]
+                            uuid_vfv = uuiddf.iloc[0]
+                            stack_df.loc[stack_df["label"] == label_stack, "uuid"] = uuid_vfv
+                            stack_df.loc[stack_df["label"] == label_stack, "label"] = label_vfv
+                        
+                        # drop vfv uuids in the overlap region
+                        # if we're in the last slice, we don't need to drop anything
 
-            if y_overlap_arr_lower is not None:
-                # if we have a previous overlap lower, we need to compute the matching
-                if previous_y_overlap_arr_upper is not None:
-                    # compute matching between previous overlap lower and current overlap upper
-                    matching = self._get_label_matching(
-                        y_overlap_arr_lower,
-                        previous_y_overlap_arr_upper,
-                        df_stack=y_overlap_df_lower,
-                        df_overlap=previous_y_overlap_df_upper,
-                        n_workers=self.n_workers)
-                        #batch_size=self.y_matching_batch_size)
-                    
-                    for label_tuple in matching:
-                        label_stack, label_vfv = label_tuple
-                        uuiddf = vfv_df["uuid"][vfv_df["label"] == label_vfv]
-                        uuid_vfv = uuiddf.iloc[0]
-                        stack_df.loc[stack_df["label"] == label_stack, "uuid"] = uuid_vfv
-                        stack_df.loc[stack_df["label"] == label_stack, "label"] = label_vfv
-                    
-                    # drop vfv uuids in the overlap region
-                    # if we're in the last slice, we don't need to drop anything
+                    previous_y_overlap_arr_upper = y_overlap_arr_upper
+                    previous_y_overlap_df_upper = y_overlap_df_upper.copy()
+
             if idx != len(overlapping_y_slices):
                 if len(vfv_df) > 0:
                     vfv_df = vfv_df[vfv_df["centroid_global_unsheared_unscaled-1"] < y_slice.stop - self.y_overlap]
                 vfv_df = pd.concat([vfv_df, stack_df])
 
-                previous_y_overlap_arr_upper = y_overlap_arr_upper
-                previous_y_overlap_df_upper = y_overlap_df_upper.copy()
 
             # saving backup of dataframe for each stack
             self._save_df(stack_df, df_bck_path)
+            ticks.update()
 
 
         y_stack_shapes_arr = np.array(saved_stack_shapes)
@@ -917,6 +952,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
         out_vfv = self.write_out_stitchfile()
         assert out_vfv.shape == self.vfv.shape, f"out_vfv.shape {out_vfv.shape} != vfv.shape {self.vfv.shape}"
         self._save_df(vfv_df, path=self.out_csv_path)
+        self.progressbar_manager.stop()
         return out_vfv, vfv_df
 
     def _save_df(self, df: pd.DataFrame, path: Path) -> None:
