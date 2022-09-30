@@ -13,11 +13,12 @@ RUN apt-get update && apt-get -y install --no-install-recommends ocl-icd-libopen
 RUN mkdir -p /etc/OpenCL/vendors && echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
 RUN python -m venv instancesegmenter_env && . instancesegmenter_env/bin/activate
 
-# installing latest skimage
-RUN git clone https://github.com/scikit-image/scikit-image.git && cd scikit-image && pip install -r requirements.txt && pip install -e . && cd ../
-
+ARG CACHEBUSTER=1
 # installing my fork of ZetaStitcher
 RUN git clone https://github.com/filippocastelli/ZetaStitcher.git && cd ZetaStitcher && pip install -r requirements.txt && pip install -e . && cd ../
+
+# installing latest skimage
+RUN git clone https://github.com/scikit-image/scikit-image.git && cd scikit-image && git checkout b1c485ef3a483cc06788537bb3807652dbb61961 && pip install -r requirements.txt && pip install -e . && cd ../
 
 #COPY requirements /requirements
 #RUN pip install -r /requirements && rm /requirements && rm -rf /root/.cache/pip/
