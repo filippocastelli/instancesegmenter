@@ -152,7 +152,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
         y_overlap: int = 5,
         y_batch_size: int = 2048,
         z_batch_size: int = 200,
-        y_matching_batch_size: int = 2000,
+        y_matching_batch_size: int = None,
         sigma_detection: float = 5.,
         sigma_outline: float = 1.,
         device_id: str = None,
@@ -163,6 +163,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
         n_saving_workers: int = -1,
         df_light_cols: list = None,
         resume: bool = False,
+        verbose: bool = False,
+        split_dataframes: bool = False
         ):
 
         self.in_fpath = in_fpath
@@ -202,6 +204,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
         self.df_light_cols = df_light_cols if df_light_cols is not None else DF_LIGHT_COLS
 
         self.resume = resume
+        self.split_dataframes = split_dataframes
+        self.verbose = verbose
 
     @staticmethod
     def _get_volume_slices(
@@ -289,7 +293,8 @@ class VirtualFusedVolumeVoronoiSegmenter:
         df_stack: pd.DataFrame = None,
         df_overlap: pd.DataFrame = None,
         n_workers: int = 1,
-        progress_bar: bool = False) -> list:
+        progress_bar: bool = False,
+        verbose: bool = False) -> list:
         """
         Get best matching labels between the stack and the overlap
         :param stack: the stack to get the overlap from
@@ -298,7 +303,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
         :param df_stack: stack df, optional
         :return: the overlap between the labels in the stack and the overlap
         """
-
+        start_time = time.time()
         assert stack.shape == overlap.shape, f"stack shape {stack.shape} != overlap shape {overlap.shape}"
 
         stack_shape = stack.shape
@@ -326,7 +331,6 @@ class VirtualFusedVolumeVoronoiSegmenter:
         enable_df_search = df_overlap is not None and df_stack is not None
         
         if n_workers > 1:
-            start_time = time.time()
             shared_stack = SharedNumpyArray(stack, name="sh_stack_matching")
             shared_overlap = SharedNumpyArray(overlap, name="sh_overlap_matching")
 
@@ -362,15 +366,10 @@ class VirtualFusedVolumeVoronoiSegmenter:
             
             shared_stack.release()
             shared_overlap.release()
-            end_time = time.time()
-            elapsed = end_time - start_time
-            per_label = elapsed / (len(stack_labels) * len(overlap_labels))
-            print(f"Multithread matching took {elapsed:.4f} seconds, {per_label:.4f} seconds per label pair")
-            
         else:
-            start_time = time.time()
         # can possibly be parallelized using multiprocessing
-            print(f"Starting single threaded label matching, {len(overlap_labels_str)} overlap labels")
+            if verbose:
+                print(f"Starting single threaded label matching, {len(overlap_labels_str)} overlap labels")
             iterable = overlap_labels_str if not progress_bar else tqdm(overlap_labels_str)
             for i, label_o_str in enumerate(iterable):
                 label_o = overlap_labels[i]
@@ -407,12 +406,6 @@ class VirtualFusedVolumeVoronoiSegmenter:
                     else:
                         jaccard_index = 0
                         pass
-
-            end_time = time.time()
-            elapsed = end_time - start_time
-            per_label = elapsed / (len(stack_labels) * len(overlap_labels))
-            print(f"Single threaded matching took {elapsed:.4f} seconds, {per_label:.4f} seconds per label pair")
-
         label_graph.add_weighted_edges_from(edge_list)
         matching = nx.max_weight_matching(label_graph, maxcardinality=True)
         # order the matching by the stack labels
@@ -422,6 +415,16 @@ class VirtualFusedVolumeVoronoiSegmenter:
         invert_tuple = lambda tup: (tup[1], tup[0])
         order_tuple = lambda tup: val_tuple(tup) if label_group(tup[0]) == "stack" else invert_tuple(val_tuple(tup))
         #order_tuple = lambda x: (x[0], x[1]) if x[0] in stack_labels else (x[1], x[0])
+        end_time = time.time()
+        if verbose:
+            elapsed = end_time - start_time
+            mode = "single threaded" if n_workers == 1 else "multithreaded"
+            try:
+                per_label = elapsed / len(matching)
+                print(f"{mode} matching took {elapsed:.4f} seconds, {per_label:.4f} seconds per match")
+            except ZeroDivisionError:
+                print(f"{mode} matching took {elapsed:.4f} seconds, too few labels to calculate time per match")
+
         return [order_tuple(x) for x in matching]
     
     @classmethod
@@ -436,7 +439,9 @@ class VirtualFusedVolumeVoronoiSegmenter:
         offset_unscaled: tuple = (0, 0, 0),
         voxel_size: tuple = (3.64, 0.52, 0.52),
         stack_slices: tuple = None,
-        n_workers: int = 1) -> Tuple[np.ndarray, pd.DataFrame]:
+        n_workers: int = 1,
+        y_matching_batch_size: int = None,
+        verbose: int = True) -> Tuple[np.ndarray, pd.DataFrame]:
         """
         Segment the stack using the voronoi algorithm
         :param stack: the stack to segment
@@ -489,8 +494,22 @@ class VirtualFusedVolumeVoronoiSegmenter:
             #corrected_overlap, _ = isc.forward_correct(cropped_overlap)
             #corrected_segmented_overlap, _ = isc.forward_correct(segmented_overlap)
 
-            matching = cls._get_label_matching(segmented_overlap, overlap_arr, n_workers=n_workers)
-
+            if y_matching_batch_size is not None:
+                if verbose:
+                    print(f"Matching in batches of {y_matching_batch_size}")
+                matching = cls._batched_label_matching(
+                    segmented_overlap,
+                    overlap_arr,
+                    batch_size=y_matching_batch_size,
+                    df_stack=None,
+                    df_overlap=None,
+                    batching_axis=1,
+                    verbose=verbose,
+                    progress_bar=False)
+            else:
+                matching = cls._get_label_matching(segmented_overlap, overlap_arr, n_workers=n_workers, verbose=verbose)
+            
+            print("Total matches", len(matching))
             for label_tuple in matching:
                 segmented_stack_arr[segmented_stack_arr == label_tuple[0]] = label_tuple[1]
 
@@ -693,7 +712,9 @@ class VirtualFusedVolumeVoronoiSegmenter:
                 voxel_size=self.voxel_size,
                 stack_slices=(z_slice, y_slice, x_slice),
                 start_label=start_label,
-                n_workers=self.n_workers)
+                n_workers=self.n_workers,
+                y_matching_batch_size=self.y_matching_batch_size,
+                verbose=self.verbose)
 
             z_border = self.z_overlap if idx < len(z_overlapping_slices) -1 else None
             y_border = self.y_overlap if y_slice.stop != self.vfv.shape[1] and self.y_overlap > 0 else None
@@ -820,15 +841,23 @@ class VirtualFusedVolumeVoronoiSegmenter:
     def _batched_label_matching(cls,
         stack: np.ndarray,
         overlap: np.ndarray,
-        batch_size: int,
+        batching_axis: int = 1,
+        batch_size: int = 1,
         df_stack: pd.DataFrame = None,
         df_overlap: pd.DataFrame = None,
+        verbose: bool = False,
+        progress_bar: bool = False,
         ) -> list:
+        start = time.time()
+        if batching_axis not in [0, 1, 2]:
+            print("batching_axis must be 0, 1, or 2")
+            batching_axis = 1
 
-        slices = cls._get_overlapping_slices(stack.shape[0], batch_size=batch_size, overlap=0)
+        slices = cls._get_overlapping_slices(stack.shape[batching_axis], batch_size=batch_size, overlap=0)
         global_matching = []
         print("Calculating y label matching...\n")
-        for _slice in tqdm(slices):
+        iterable = slices if not progress_bar else tqdm(slices)
+        for _slice in iterable:
             if df_stack is not None and df_overlap is not None:
                 _get_subdf = lambda df, sel_slice : df[df["centroid_global_unsheared_unscaled-0"] > sel_slice.start][df["centroid_global_unsheared_unscaled-0"]< sel_slice.stop]
                 b_df_stack = _get_subdf(df_stack, _slice)
@@ -836,11 +865,29 @@ class VirtualFusedVolumeVoronoiSegmenter:
             else:
                 b_df_stack = None
                 b_df_overlap = None
+            
+            if batching_axis == 0:
+                b_stack = stack[_slice, :, :]
+                b_overlap = overlap[_slice, :, :]
+            elif batching_axis == 1:
+                b_stack = stack[:, _slice, :]
+                b_overlap = overlap[:, _slice, :]
+            elif batching_axis == 2:
+                b_stack = stack[:, :, _slice]
+                b_overlap = overlap[:, :, _slice]
 
-            b_stack = stack[_slice, :, :]
-            b_overlap = overlap[_slice, :, :]
+            local_matching = cls._get_label_matching(b_stack, b_overlap, df_stack=b_df_stack, df_overlap=b_df_overlap, verbose=False, progress_bar=False)
 
-            global_matching.append(cls._get_label_matching(b_stack, b_overlap, b_df_stack, b_df_overlap))
+            global_matching.extend(local_matching)
+        end = time.time()
+        if verbose:
+            print("Total matches: {}".format(len(global_matching)))
+            elapsed = end - start
+            try:
+                per_label = elapsed / len(global_matching)
+                print(f"Batched matching with batchsize {batch_size} took {elapsed:.4f} seconds, {per_label:.4f} seconds per match")
+            except ZeroDivisionError:
+                print(f"Batched matching with batchsize {batch_size} took {elapsed:.4f} seconds, too few labels to calculate time per match")
 
         return global_matching
         
@@ -874,12 +921,15 @@ class VirtualFusedVolumeVoronoiSegmenter:
         saved_stack_shapes = []
         self.progressbar_manager = enlighten.get_manager()
         ticks = self.progressbar_manager.counter(total=len(overlapping_y_slices), desc="Y-Stacks", unit="y-stack", color="red")
+        backup_dfs = []
         for idx, y_slice in enumerate(overlapping_y_slices):
             print(f"Segmenting y-stack {idx}/{len(overlapping_y_slices)-1}..." )
             
             out_stack_fname = self._get_stack_fname((0, y_slice.start, 0))
             out_stack_fpath = self.output_path.joinpath(out_stack_fname)
-            df_bck_path = self.out_csv_path.parent.joinpath(f"df_bck_{idx}.csv")
+            df_back_name = f"df_bck_{idx}.csv" if not self.split_dataframes else f"df_split_{idx}.csv"
+            df_bck_path = self.out_csv_path.parent.joinpath(df_back_name)
+            backup_dfs.append(df_bck_path)
 
             if self.resume and out_stack_fpath.exists() and len(list(out_stack_fpath.glob("*.tif"))) == self.vfv.shape[0] and df_bck_path.exists():
                 print("Skipping y-stack prediction...")
@@ -939,27 +989,34 @@ class VirtualFusedVolumeVoronoiSegmenter:
                     vfv_df = vfv_df[vfv_df["centroid_global_unsheared_unscaled-1"] < y_slice.stop - self.y_overlap]
                 vfv_df = pd.concat([vfv_df, stack_df])
 
-
             # saving backup of dataframe for each stack
             self._save_df(stack_df, df_bck_path)
+
+            if self.y_overlap == 0 and self.split_dataframes:
+                stack_df = pd.DataFrame()
+            
             ticks.update()
 
-
+        self.progressbar_manager.stop()
         y_stack_shapes_arr = np.array(saved_stack_shapes)
         y_len = np.sum(y_stack_shapes_arr[:, 1])
         assert y_len == self.vfv.shape[1], f"y_len {y_len} != vfv.shape[1] {self.vfv.shape[1]}"
 
         out_vfv = self.write_out_stitchfile()
         assert out_vfv.shape == self.vfv.shape, f"out_vfv.shape {out_vfv.shape} != vfv.shape {self.vfv.shape}"
-        self._save_df(vfv_df, path=self.out_csv_path)
-        self.progressbar_manager.stop()
-        return out_vfv, vfv_df
+        if not self.split_dataframes:
+            self._save_df(vfv_df, path=self.out_csv_path)
+            return out_vfv, vfv_df
+        else:
+            return out_vfv, backup_dfs 
 
     def _save_df(self, df: pd.DataFrame, path: Path) -> None:
         if path.exists():
             path.unlink()
         df.to_csv(path)
-        light_df = df[self.df_light_cols]
+
+        actual_cols = [col_name for col_name in self.df_light_cols if col_name in df.columns]
+        light_df = df[actual_cols]
         light_df.to_csv(path.with_suffix(".light.csv"))
 
     def write_out_stitchfile(self) -> VirtualFusedVolume:
@@ -1008,6 +1065,8 @@ def main():
     parser.add_argument('-nw', '--n-workers', dest='nworkers', type=int, default=1, help="number of workers", required=False)
     parser.add_argument('-nsw', '--n-saving-workers', dest='nsavingworkers', type=int, default=1, help="number of workers for saving", required=False)
     parser.add_argument('-r', '--resume', dest='resume', action='store_true', help="resume", required=False)
+    parser.add_argument('-v', '--verbose', dest='verbose', action='store_true', help="verbose", required=False)
+    parser.add_argument('-sdf', '--split-dataframes', dest='split_dataframes', action='store_true', help="split dataframes", required=False)
     #parser.add_argument('-s', '--start', dest='start', help='start index', default=0, required=False)
     #parser.add_argument('-e', '--end', dest='end', help='end index', default=-1, required=False)
 
@@ -1031,6 +1090,8 @@ def main():
     n_saving_workers = int(args.nsavingworkers)
     y_matching_batch_size = int(args.ymatchingbatch)
     resume = bool(args.resume)
+    verbose = bool(args.verbose)
+    split_dataframes = bool(args.split_dataframes)
 
 
 
@@ -1049,7 +1110,10 @@ def main():
         n_workers=n_workers,
         n_saving_workers=n_saving_workers,
         y_matching_batch_size=y_matching_batch_size,
-        resume=resume)
+        resume=resume,
+        verbose=verbose,
+        split_dataframes=split_dataframes,
+    )
 
 
     segm_vfv, segm_df = segm.segment_vfv()
