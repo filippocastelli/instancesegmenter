@@ -3,3 +3,5 @@ from vfv_instance_segment.integershearingcorrect import IntegerShearingCorrect
 
 from vfv_instance_segment.vfv_segment import VirtualFusedVolumeVoronoiSegmenter
 from vfv_instance_segment.vfv_segment import SharedNumpyArray
+
+from vfv_instance_segment.visualizer import PointCloudVisualizer
