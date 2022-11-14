@@ -455,7 +455,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
             cropped_vol = stack
 
         # apply shearing correction
-        shearing_corrector = IntegerShearingCorrect(direction='x', delta=shear_shift)
+        shearing_corrector = IntegerShearingCorrect(direction='y', delta=shear_shift)
         corrected_vol, _ = shearing_corrector.forward_correct(cropped_vol)
 
         # push the stack to the GPU
@@ -471,7 +471,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
         if start_label > 0:
             segmented_stack_arr = np.where(segmented_stack_arr > 0, segmented_stack_arr + start_label, 0)
         
-        unsheared_segmented_stack = shearing_corrector.inverse_correct(segmented_stack_arr)
+        unsheared_segmented_stack, _ = shearing_corrector.inverse_correct(segmented_stack_arr)
         if autocrop: 
             unsheared_segmented_stack = cropper.uncrop(unsheared_segmented_stack)
 
@@ -529,7 +529,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
             crop_offset=cropper.pads[2][0])
 
 
-        segmented_stack_arr = shearing_corrector.inverse_correct(segmented_stack_arr)
+        segmented_stack_arr, _ = shearing_corrector.inverse_correct(segmented_stack_arr)
         if autocrop: 
             segmented_stack_arr = cropper.uncrop(segmented_stack_arr)
 
@@ -574,7 +574,7 @@ class VirtualFusedVolumeVoronoiSegmenter:
             
             get_cols_partial = partial(cls._get_coords_df_row,
                 shear_shift=shear_shift,
-                crop_offset_x=crop_offset,
+                crop_offset=crop_offset,
                 global_offset=offset_unscaled,
                 voxel_size=voxel_size,
                 arr_depth=segmented_stack.shape[0])
@@ -598,21 +598,36 @@ class VirtualFusedVolumeVoronoiSegmenter:
         return stack_df
 
     @classmethod
-    def _get_coords_df_row(cls, df_row, shear_shift, crop_offset_x, global_offset, voxel_size, arr_depth):
+    def _get_coords_df_row(cls,
+        df_row,
+        crop_offset,
+        global_offset,
+        voxel_size,
+        arr_depth,
+        shear_axis="y",
+        by_axis="z",
+        shear_shift=-7):
         coord_tuple = (df_row["centroid_stack_sheared_unscaled-0"], df_row["centroid_stack_sheared_unscaled-1"], df_row["centroid_stack_sheared_unscaled-2"])
         
         label_list = []
         value_list = []
 
         stack_cropped_sheared = list(coord_tuple)
-        stack_cropped_unsheared = list(cls._shear_coord(stack_cropped_sheared, shear_shift, back_transform=True))
+        stack_cropped_unsheared = list(cls._shear_coord(
+            coord=stack_cropped_sheared,
+            shear_shift=shear_shift,
+            back_transform=True,
+            by_axis=by_axis))
 
         #for i in range(3):
         #    label_list.append(["centroid_stack_unsheared_crop-{}".format(i)])
         #    value_list.append([stack_cropped_unsheared[i]])
 
+        idxs_dict = {"z": 0, "y": 1, "x": 2}
+        
         stack_uncropped_unsheared = stack_cropped_unsheared.copy()
-        stack_uncropped_unsheared[2] += crop_offset_x + arr_depth*shear_shift
+        stack_uncropped_unsheared[2] += crop_offset
+        stack_uncropped_unsheared[idxs_dict[shear_axis]] += arr_depth*shear_shift
 
         for i in range(3):
             label_list.append("centroid_stack_unsheared_unscaled-{}".format(i))
@@ -651,9 +666,12 @@ class VirtualFusedVolumeVoronoiSegmenter:
             yield slice(start, end, 1)
 
     @staticmethod
-    def _shear_coord(coord: tuple, shear_shift:int, back_transform: bool = False) -> tuple:
+    def _shear_coord(coord: tuple, shear_shift:int, back_transform: bool = False, shear_axis="y", by_axis="z") -> tuple:
+        idxs_dict = {"z": 0, "y": 1, "x": 2}
         shear_shift = -shear_shift if back_transform else shear_shift
-        return (coord[0], coord[1], coord[2] + shear_shift*coord[0])
+        new_coord = list(coord)
+        new_coord[idxs_dict[shear_axis]] += shear_shift * coord[idxs_dict[by_axis]]
+        return new_coord
 
     @staticmethod
     def _get_overlap_df(df: pd.DataFrame, y_offset: int, y_depth: tuple, overlap_size: int, mode="upper") -> pd.DataFrame:
@@ -743,8 +761,14 @@ class VirtualFusedVolumeVoronoiSegmenter:
             z_slice_df = pd.concat([z_slice_df, substack_df], ignore_index=True)
             # DATAFRAME REFERS TO THE SHEARING_CORRECTED STACK
             if idx > 0:
-                start_label = np.uint32(z_slice_df.label.max() + 1) if "label" in z_slice_df else 1
-                # this should roll when we get to uint32.max
+                if "label" in z_slice_df:
+                    maxlabel = z_slice_df["label"].max()
+                    if not np.isnan(maxlabel):
+                        # this should roll when we get to uint32.max
+                        start_label = np.uint32(maxlabel + 1)
+                    else:
+                        start_label = 1
+                
             tocks.update()
         tocks.close()
         shapes_arr = np.array(sub_arr_shapes)
